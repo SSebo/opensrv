@@ -33,7 +33,7 @@ fn it_parses_handshake() {
     let r = Cursor::new(&data[..]);
     let mut pr = PacketReader::new(r);
     let (_, p) = pr.next().unwrap().unwrap();
-    let (_, handshake) = client_handshake(&p).unwrap();
+    let (_, handshake) = client_handshake(&p, false).unwrap();
     println!("{:?}", handshake);
     assert!(handshake
         .capabilities

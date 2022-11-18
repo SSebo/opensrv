@@ -25,12 +25,80 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 ///    so that trivial async writes could be avoided
 /// - behaves like a async writer, while writing data to the output stream
 pub struct PacketWriter<W> {
+    inner: Option<Inner<W>>,
+}
+
+struct Inner<W> {
     packet_builder: PacketBuilder,
     output_stream: W,
 }
 
+impl<W> PacketWriter<W> {
+    pub fn new(output_stream: W) -> Self {
+        Self {
+            inner: Some(Inner {
+                packet_builder: PacketBuilder::new(),
+                output_stream,
+            }),
+        }
+    }
+
+    pub fn set_seq(&mut self, seq: u8) {
+        match self.inner {
+            Some(ref mut writer) => writer.packet_builder.set_seq(seq),
+            None => unreachable!(),
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    pub(crate) fn replace(&mut self, output_stream: W) {
+        self.inner = Some(Inner {
+            packet_builder: PacketBuilder::new(),
+            output_stream,
+        })
+    }
+
+    #[cfg(feature = "tls")]
+    pub(crate) fn take(&mut self) -> Option<W> {
+        let inner = self.inner.take()?;
+        Some(inner.output_stream)
+    }
+}
+
 // exports the internal builder as sync Write
 impl<W> Write for PacketWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.inner {
+            Some(ref mut writer) => writer.write(buf),
+            None => unreachable!(),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self.inner {
+            Some(ref mut writer) => writer.flush(),
+            None => unreachable!(),
+        }
+    }
+}
+
+impl<W: AsyncWrite + Unpin> PacketWriter<W> {
+    pub async fn end_packet(&mut self) -> io::Result<()> {
+        match self.inner {
+            Some(ref mut writer) => writer.end_packet().await,
+            None => unreachable!(),
+        }
+    }
+
+    pub async fn flush_all(&mut self) -> io::Result<()> {
+        match self.inner {
+            Some(ref mut writer) => writer.flush_all().await,
+            None => unreachable!(),
+        }
+    }
+}
+
+impl<W> Write for Inner<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.packet_builder.write(buf)
     }
@@ -40,20 +108,8 @@ impl<W> Write for PacketWriter<W> {
     }
 }
 
-impl<W> PacketWriter<W> {
-    pub fn new(output_stream: W) -> Self {
-        Self {
-            packet_builder: PacketBuilder::new(),
-            output_stream,
-        }
-    }
-    pub fn set_seq(&mut self, seq: u8) {
-        self.packet_builder.set_seq(seq)
-    }
-}
-
 const PACKET_HEADER_SIZE: usize = 4;
-impl<W: AsyncWrite + Unpin> PacketWriter<W> {
+impl<W: AsyncWrite + Unpin> Inner<W> {
     /// Build packet(s) and write them to the output stream
     pub async fn end_packet(&mut self) -> io::Result<()> {
         let builder = &mut self.packet_builder;

@@ -19,6 +19,10 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 
 pub struct PacketReader<R> {
+    inner: Option<Inner<R>>,
+}
+
+struct Inner<R> {
     bytes: Vec<u8>,
     start: usize,
     remaining: usize,
@@ -28,15 +32,52 @@ pub struct PacketReader<R> {
 impl<R> PacketReader<R> {
     pub fn new(r: R) -> Self {
         PacketReader {
+            inner: Some(Inner {
+                bytes: Vec::new(),
+                start: 0,
+                remaining: 0,
+                r,
+            }),
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    pub(crate) fn replace(&mut self, r: R) {
+        self.inner = Some(Inner {
             bytes: Vec::new(),
             start: 0,
             remaining: 0,
             r,
-        }
+        })
+    }
+
+    #[cfg(feature = "tls")]
+    pub(crate) fn take(&mut self) -> Option<R> {
+        let inner = self.inner.take()?;
+        Some(inner.r)
     }
 }
 
 impl<R: Read> PacketReader<R> {
+    #[allow(dead_code)]
+    pub fn next(&mut self) -> io::Result<Option<(u8, Packet<'_>)>> {
+        match self.inner {
+            Some(ref mut reader) => reader.next(),
+            None => unreachable!(),
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> PacketReader<R> {
+    pub async fn next_async(&mut self) -> io::Result<Option<(u8, Packet<'_>)>> {
+        match self.inner {
+            Some(ref mut reader) => reader.next_async().await,
+            None => unreachable!(),
+        }
+    }
+}
+
+impl<R: Read> Inner<R> {
     #[allow(dead_code)]
     pub fn next(&mut self) -> io::Result<Option<(u8, Packet<'_>)>> {
         self.start = self.bytes.len() - self.remaining;
@@ -93,7 +134,7 @@ impl<R: Read> PacketReader<R> {
     }
 }
 
-impl<R: AsyncRead + Unpin> PacketReader<R> {
+impl<R: AsyncRead + Unpin> Inner<R> {
     pub async fn next_async(&mut self) -> io::Result<Option<(u8, Packet<'_>)>> {
         self.start = self.bytes.len() - self.remaining;
 
