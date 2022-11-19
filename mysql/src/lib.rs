@@ -38,8 +38,6 @@ use tokio_rustls::rustls::{Certificate, ServerConfig};
 pub use crate::myc::constants::{CapabilityFlags, ColumnFlags, ColumnType, StatusFlags};
 
 mod commands;
-#[cfg(feature = "tls")]
-mod duplex;
 mod errorcodes;
 mod packet_reader;
 mod packet_writer;
@@ -263,7 +261,7 @@ impl<B, S, W> AsyncMysqlIntermediary<B, S, W>
 where
     W: AsyncWrite + Send + Unpin,
     B: AsyncMysqlShim<W> + Send + Sync,
-    S: AsyncRead + Unpin,
+    S: AsyncRead + Send + Unpin,
 {
     /// Create a new server over two one-way channels and process client commands until the client
     /// disconnects or an error occurs.
@@ -286,18 +284,39 @@ where
         let (is_ssl, params) =
             AsyncMysqlIntermediary::init_before_ssl(&mut shim, &mut reader, &mut writer).await?;
 
-        let mut mi = AsyncMysqlIntermediary {
-            client_capabilities,
-            process_use_statement_on_query,
-            shim,
-            reader,
-            writer,
-        };
+        match &shim.tls_config() {
+            #[cfg(feature = "tls")]
+            Some(ref config) if is_ssl => {
+                let (r, w) = tls::switch_to_tls(config.clone(), reader, writer).await?;
+                let reader = PacketReader::new(r);
+                let writer = PacketWriter::new(w);
+                let mi = AsyncMysqlIntermediary {
+                    client_capabilities,
+                    process_use_statement_on_query,
+                    shim,
+                    reader,
+                    writer,
+                };
 
-        if let Some((handshake, seq, auth_context)) = params {
-            mi.init_after_ssl(handshake, seq, auth_context).await?;
+                if let Some((handshake, seq, auth_context)) = params {
+                    mi.init_after_ssl(handshake, seq, auth_context).await?;
+                }
+                mi.run().await
+            }
+            _ => {
+                let mi = AsyncMysqlIntermediary {
+                    client_capabilities,
+                    process_use_statement_on_query,
+                    shim,
+                    reader,
+                    writer,
+                };
+                if let Some((handshake, seq, auth_context)) = params {
+                    mi.init_after_ssl(handshake, seq, auth_context).await?;
+                }
+                mi.run().await
+            }
         }
-        mi.run().await
     }
 
     async fn init_before_ssl(
@@ -371,7 +390,7 @@ where
                 "peer terminated connection",
             )
         })?;
-        let mut handshake = commands::client_handshake(&handshake, false)
+        let handshake = commands::client_handshake(&handshake, false)
             .map_err(|e| match e {
                 nom::Err::Incomplete(_) => io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -416,14 +435,14 @@ where
 
         #[cfg(feature = "tls")]
         if handshake.capabilities.contains(CapabilityFlags::CLIENT_SSL) {
-            let config = tls_conf.ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "client requested SSL despite us not advertising support for it",
-                )
-            })?;
+            // let config = tls_conf.ok_or_else(|| {
+            //     io::Error::new(
+            //         io::ErrorKind::InvalidData,
+            //         "client requested SSL despite us not advertising support for it",
+            //     )
+            // })?;
 
-            is_ssl = true;
+            is_ssl = tls_conf.is_some();
             // tls::switch_to_tls(config, &mut self.reader, &mut self.writer).await?;
 
             // auth_context.tls_client_certs = self.rw.tls_certs();
