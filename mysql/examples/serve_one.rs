@@ -65,7 +65,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         let (stream, _) = listener.accept().await?;
-        let (r, w) = stream.into_split();
-        tokio::spawn(async move { AsyncMysqlIntermediary::run_on(Backend, r, w).await });
+        let (mut r, mut w) = stream.into_split();
+
+        tokio::spawn(async move {
+            let (is_ssl, params) =
+                AsyncMysqlIntermediary::init_before_ssl(&mut Backend, &mut r, &mut w)
+                    .await
+                    .unwrap();
+            // match <Backend as opensrv_mysql::AsyncMysqlShim<W>>::tls_config(&Backend) {
+            match Backend.tls_config() {
+                Some(config) if is_ssl => {
+                    let (r, w) = switch_to_tls(config.clone(), r, w).await.unwrap();
+                    let _ = AsyncMysqlIntermediary::run_on(Backend, r, w).await;
+                    // let reader = PacketReader::new(r);
+                    // let writer = PacketWriter::new(w);
+                    // let mi = AsyncMysqlIntermediary {
+                    //     client_capabilities,
+                    //     process_use_statement_on_query,
+                    //     shim,
+                    //     reader,
+                    //     writer,
+                    // };
+
+                    // if let Some((handshake, seq, auth_context)) = params {
+                    //     mi.init_after_ssl(handshake, seq, auth_context).await?;
+                    // }
+                    // mi.run().await
+                }
+                _ => {
+                    let _ = AsyncMysqlIntermediary::run_on(Backend, r, w).await;
+                }
+            }
+        });
     }
 }

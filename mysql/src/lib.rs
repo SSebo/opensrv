@@ -36,6 +36,7 @@ use tokio::io::AsyncWrite;
 use tokio_rustls::rustls::{Certificate, ServerConfig};
 
 pub use crate::myc::constants::{CapabilityFlags, ColumnFlags, ColumnType, StatusFlags};
+pub use tls::switch_to_tls;
 
 mod commands;
 mod errorcodes;
@@ -273,57 +274,44 @@ where
     /// disconnects or an error occurs, with config options.
     pub async fn run_with_options(
         mut shim: B,
-        input_stream: S,
-        output_stream: W,
+        mut input_stream: S,
+        mut output_stream: W,
         opts: &IntermediaryOptions,
     ) -> Result<(), B::Error> {
-        let mut reader = PacketReader::new(input_stream);
-        let mut writer = PacketWriter::new(output_stream);
         let client_capabilities = CapabilityFlags::from_bits_truncate(0);
         let process_use_statement_on_query = opts.process_use_statement_on_query;
-        let (is_ssl, params) =
-            AsyncMysqlIntermediary::init_before_ssl(&mut shim, &mut reader, &mut writer).await?;
+        let (is_ssl, params) = AsyncMysqlIntermediary::init_before_ssl(
+            &mut shim,
+            &mut input_stream,
+            &mut output_stream,
+        )
+        .await?;
 
-        match &shim.tls_config() {
-            #[cfg(feature = "tls")]
-            Some(ref config) if is_ssl => {
-                let (r, w) = tls::switch_to_tls(config.clone(), reader, writer).await?;
-                let reader = PacketReader::new(r);
-                let writer = PacketWriter::new(w);
-                let mi = AsyncMysqlIntermediary {
-                    client_capabilities,
-                    process_use_statement_on_query,
-                    shim,
-                    reader,
-                    writer,
-                };
+        let mut reader = PacketReader::new(input_stream);
+        let mut writer = PacketWriter::new(output_stream);
 
-                if let Some((handshake, seq, auth_context)) = params {
-                    mi.init_after_ssl(handshake, seq, auth_context).await?;
-                }
-                mi.run().await
-            }
-            _ => {
-                let mi = AsyncMysqlIntermediary {
-                    client_capabilities,
-                    process_use_statement_on_query,
-                    shim,
-                    reader,
-                    writer,
-                };
-                if let Some((handshake, seq, auth_context)) = params {
-                    mi.init_after_ssl(handshake, seq, auth_context).await?;
-                }
-                mi.run().await
-            }
+        let mut mi = AsyncMysqlIntermediary {
+            client_capabilities,
+            process_use_statement_on_query,
+            shim,
+            reader,
+            writer,
+        };
+        if let Some((handshake, seq, auth_context)) = params {
+            mi.init_after_ssl(handshake, seq, auth_context).await?;
         }
+        mi.run().await
+        // }
+        // }
     }
 
-    async fn init_before_ssl(
+    pub async fn init_before_ssl(
         shim: &mut B,
-        reader: &mut PacketReader<S>,
-        writer: &mut PacketWriter<W>,
+        input_stream: &mut S,
+        output_stream: &mut W,
     ) -> Result<(bool, Option<(ClientHandshake, u8, AuthenticationContext)>), B::Error> {
+        let mut reader = PacketReader::new(input_stream);
+        let mut writer = PacketWriter::new(output_stream);
         #[cfg(feature = "tls")]
         let tls_conf = shim.tls_config();
 

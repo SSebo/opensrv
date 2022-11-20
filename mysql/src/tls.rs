@@ -2,18 +2,16 @@ use std::io::IoSlice;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crate::{packet_reader::PacketReader, packet_writer::PacketWriter};
-
 use pin_project_lite::pin_project;
 use tokio::io::{self, AsyncRead, AsyncWrite, ReadBuf};
 use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
 
-pub async fn switch_to_tls<R: AsyncRead + Unpin, W: AsyncWrite + Send + Unpin>(
+pub async fn switch_to_tls<R: AsyncRead + Send + Unpin, W: AsyncWrite + Send + Unpin>(
     config: std::sync::Arc<ServerConfig>,
-    mut reader: PacketReader<R>,
-    mut writer: PacketWriter<W>,
+    reader: R,
+    writer: W,
 ) -> std::io::Result<(impl AsyncRead + Send, impl AsyncWrite + Send)> {
-    let stream = Duplex::new(reader.take().unwrap(), writer.take().unwrap());
+    let stream = Duplex::new(reader, writer);
     let acceptor = TlsAcceptor::from(config);
     let stream = acceptor.accept(stream).await?;
     let (r, w) = tokio::io::split(stream);
