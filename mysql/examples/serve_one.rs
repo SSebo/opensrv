@@ -18,11 +18,19 @@
 //! $ echo "SELECT * FROM foo" | mysql -h 127.0.0.1 --table
 //! ```
 
-use std::io;
+use rustls_pemfile::{certs, pkcs8_private_keys};
+use std::{
+    fs::File,
+    io::{self, BufReader, ErrorKind},
+    sync::Arc,
+};
 use tokio::io::AsyncWrite;
+use tokio_rustls::rustls::{Certificate, PrivateKey};
 
 use opensrv_mysql::*;
 use tokio::net::TcpListener;
+// use tokio_rustls::rustls::rustls_pemfile::{certs, pkcs8_private_keys};
+use tokio_rustls::rustls::{server::NoClientAuth, ServerConfig, ALL_CIPHER_SUITES, ALL_VERSIONS};
 
 struct Backend;
 
@@ -59,6 +67,23 @@ impl<W: AsyncWrite + Send + Unpin> AsyncMysqlShim<W> for Backend {
     }
 }
 
+fn setup_tls() -> Result<ServerConfig, io::Error> {
+    let cert = certs(&mut BufReader::new(File::open("examples/ssl/server.crt")?))
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid cert"))
+        .map(|mut certs| certs.drain(..).map(Certificate).collect())?;
+    let key = pkcs8_private_keys(&mut BufReader::new(File::open("examples/ssl/server.key")?))
+        .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "invalid key"))
+        .map(|mut keys| keys.drain(..).map(PrivateKey).next().unwrap())?;
+
+    let config = ServerConfig::builder()
+        .with_safe_defaults()
+        .with_no_client_auth()
+        .with_single_cert(cert, key)
+        .map_err(|err| io::Error::new(ErrorKind::InvalidInput, err))?;
+
+    Ok(config)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("0.0.0.0:3306").await?;
@@ -68,15 +93,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (mut r, mut w) = stream.into_split();
 
         tokio::spawn(async move {
+            let tls_config = setup_tls().unwrap();
+            let tls_config = Some(Arc::new(tls_config));
             let (is_ssl, params) =
-                AsyncMysqlIntermediary::init_before_ssl(&mut Backend, &mut r, &mut w)
+                AsyncMysqlIntermediary::init_before_ssl(&mut Backend, &mut r, &mut w, &tls_config)
                     .await
                     .unwrap();
             // match <Backend as opensrv_mysql::AsyncMysqlShim<W>>::tls_config(&Backend) {
-            match Backend.tls_config() {
+            match &tls_config {
                 Some(config) if is_ssl => {
                     let (r, w) = switch_to_tls(config.clone(), r, w).await.unwrap();
-                    let _ = AsyncMysqlIntermediary::run_on(Backend, r, w).await;
+                    let _ = AsyncMysqlIntermediary::run_on(Backend, r, w, tls_config).await;
                     // let reader = PacketReader::new(r);
                     // let writer = PacketWriter::new(w);
                     // let mi = AsyncMysqlIntermediary {
@@ -93,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // mi.run().await
                 }
                 _ => {
-                    let _ = AsyncMysqlIntermediary::run_on(Backend, r, w).await;
+                    let _ = AsyncMysqlIntermediary::run_on(Backend, r, w, tls_config).await;
                 }
             }
         });

@@ -204,11 +204,11 @@ pub trait AsyncMysqlShim<W: Send> {
         Ok(())
     }
 
-    /// Provides the TLS configuration, if we want to support TLS.
-    #[cfg(feature = "tls")]
-    fn tls_config(&self) -> Option<std::sync::Arc<ServerConfig>> {
-        None
-    }
+    // /// Provides the TLS configuration, if we want to support TLS.
+    // #[cfg(feature = "tls")]
+    // fn tls_config(&self) -> Option<std::sync::Arc<ServerConfig>> {
+    //     None
+    // }
 
     /// Called after successful authentication (including TLS if applicable) passing relevant
     /// information to allow additional logic in the MySqlShim implementation.
@@ -256,6 +256,7 @@ pub struct AsyncMysqlIntermediary<B, S: AsyncRead + Unpin, W> {
     shim: B,
     reader: packet_reader::PacketReader<S>,
     writer: packet_writer::PacketWriter<W>,
+    tls_conf: Option<std::sync::Arc<ServerConfig>>,
 }
 
 impl<B, S, W> AsyncMysqlIntermediary<B, S, W>
@@ -266,8 +267,13 @@ where
 {
     /// Create a new server over two one-way channels and process client commands until the client
     /// disconnects or an error occurs.
-    pub async fn run_on(shim: B, stream: S, output_stream: W) -> Result<(), B::Error> {
-        Self::run_with_options(shim, stream, output_stream, &Default::default()).await
+    pub async fn run_on(
+        shim: B,
+        stream: S,
+        output_stream: W,
+        tls_conf: Option<std::sync::Arc<ServerConfig>>,
+    ) -> Result<(), B::Error> {
+        Self::run_with_options(shim, stream, output_stream, &Default::default(), tls_conf).await
     }
 
     /// Create a new server over two one-way channels and process client commands until the client
@@ -277,6 +283,7 @@ where
         mut input_stream: S,
         mut output_stream: W,
         opts: &IntermediaryOptions,
+        tls_conf: Option<std::sync::Arc<ServerConfig>>,
     ) -> Result<(), B::Error> {
         let client_capabilities = CapabilityFlags::from_bits_truncate(0);
         let process_use_statement_on_query = opts.process_use_statement_on_query;
@@ -284,6 +291,7 @@ where
             &mut shim,
             &mut input_stream,
             &mut output_stream,
+            &tls_conf,
         )
         .await?;
 
@@ -296,6 +304,7 @@ where
             shim,
             reader,
             writer,
+            tls_conf,
         };
         if let Some((handshake, seq, auth_context)) = params {
             mi.init_after_ssl(handshake, seq, auth_context).await?;
@@ -309,12 +318,10 @@ where
         shim: &mut B,
         input_stream: &mut S,
         output_stream: &mut W,
+        tls_conf: &Option<std::sync::Arc<ServerConfig>>,
     ) -> Result<(bool, Option<(ClientHandshake, u8, AuthenticationContext)>), B::Error> {
         let mut reader = PacketReader::new(input_stream);
         let mut writer = PacketWriter::new(output_stream);
-        #[cfg(feature = "tls")]
-        let tls_conf = shim.tls_config();
-
         // https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::HandshakeV10
         writer.write_all(&[10])?; // protocol 10
 
