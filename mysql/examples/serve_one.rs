@@ -25,12 +25,10 @@ use std::{
     sync::Arc,
 };
 use tokio::io::AsyncWrite;
-use tokio_rustls::rustls::{Certificate, PrivateKey};
+use tokio_rustls::rustls::{Certificate, PrivateKey, ServerConfig};
 
 use opensrv_mysql::*;
 use tokio::net::TcpListener;
-// use tokio_rustls::rustls::rustls_pemfile::{certs, pkcs8_private_keys};
-use tokio_rustls::rustls::{server::NoClientAuth, ServerConfig, ALL_CIPHER_SUITES, ALL_VERSIONS};
 
 struct Backend;
 
@@ -90,39 +88,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     loop {
         let (stream, _) = listener.accept().await?;
-        let (mut r, mut w) = stream.into_split();
+        let (r, w) = stream.into_split();
 
         tokio::spawn(async move {
             let tls_config = setup_tls().unwrap();
-            let tls_config = Some(Arc::new(tls_config));
-            let (is_ssl, params) =
-                AsyncMysqlIntermediary::init_before_ssl(&mut Backend, &mut r, &mut w, &tls_config)
-                    .await
-                    .unwrap();
-            // match <Backend as opensrv_mysql::AsyncMysqlShim<W>>::tls_config(&Backend) {
-            match &tls_config {
-                Some(config) if is_ssl => {
-                    let (r, w) = switch_to_tls(config.clone(), r, w).await.unwrap();
-                    let _ = AsyncMysqlIntermediary::run_on(Backend, r, w, tls_config).await;
-                    // let reader = PacketReader::new(r);
-                    // let writer = PacketWriter::new(w);
-                    // let mi = AsyncMysqlIntermediary {
-                    //     client_capabilities,
-                    //     process_use_statement_on_query,
-                    //     shim,
-                    //     reader,
-                    //     writer,
-                    // };
+            let tls_config = Arc::new(tls_config);
 
-                    // if let Some((handshake, seq, auth_context)) = params {
-                    //     mi.init_after_ssl(handshake, seq, auth_context).await?;
-                    // }
-                    // mi.run().await
-                }
-                _ => {
-                    let _ = AsyncMysqlIntermediary::run_on(Backend, r, w, tls_config).await;
-                }
-            }
+            secure_run_with_options!(Backend, r, w, IntermediaryOptions::default(), tls_config)
+                .await
         });
     }
 }

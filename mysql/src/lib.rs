@@ -45,7 +45,7 @@ mod packet_writer;
 mod params;
 mod resultset;
 #[cfg(feature = "tls")]
-mod tls;
+pub mod tls;
 mod value;
 mod writers;
 
@@ -109,7 +109,7 @@ pub trait AsyncMysqlShim<W: Send> {
     /// The error type produced by operations on this shim.
     ///
     /// Must implement `From<io::Error>` so that transport-level errors can be lifted.
-    type Error: From<io::Error>;
+    type Error: From<io::Error> + std::fmt::Debug;
 
     /// Server version
     fn version(&self) -> &str {
@@ -256,7 +256,6 @@ pub struct AsyncMysqlIntermediary<B, S: AsyncRead + Unpin, W> {
     shim: B,
     reader: packet_reader::PacketReader<S>,
     writer: packet_writer::PacketWriter<W>,
-    tls_conf: Option<std::sync::Arc<ServerConfig>>,
 }
 
 impl<B, S, W> AsyncMysqlIntermediary<B, S, W>
@@ -267,13 +266,8 @@ where
 {
     /// Create a new server over two one-way channels and process client commands until the client
     /// disconnects or an error occurs.
-    pub async fn run_on(
-        shim: B,
-        stream: S,
-        output_stream: W,
-        tls_conf: Option<std::sync::Arc<ServerConfig>>,
-    ) -> Result<(), B::Error> {
-        Self::run_with_options(shim, stream, output_stream, &Default::default(), tls_conf).await
+    pub async fn run_on(shim: B, stream: S, output_stream: W) -> Result<(), B::Error> {
+        Self::run_with_options(shim, stream, output_stream, &Default::default()).await
     }
 
     /// Create a new server over two one-way channels and process client commands until the client
@@ -283,43 +277,43 @@ where
         mut input_stream: S,
         mut output_stream: W,
         opts: &IntermediaryOptions,
-        tls_conf: Option<std::sync::Arc<ServerConfig>>,
     ) -> Result<(), B::Error> {
-        let client_capabilities = CapabilityFlags::from_bits_truncate(0);
         let process_use_statement_on_query = opts.process_use_statement_on_query;
-        let (is_ssl, params) = AsyncMysqlIntermediary::init_before_ssl(
+        let (_, init_params) = AsyncMysqlIntermediary::init_ssl(
             &mut shim,
             &mut input_stream,
             &mut output_stream,
-            &tls_conf,
+            &None,
         )
         .await?;
 
-        let mut reader = PacketReader::new(input_stream);
-        let mut writer = PacketWriter::new(output_stream);
+        let reader = PacketReader::new(input_stream);
+        let writer = PacketWriter::new(output_stream);
 
+        let (handshake, seq, auth_context, client_capabilities) = init_params;
         let mut mi = AsyncMysqlIntermediary {
             client_capabilities,
             process_use_statement_on_query,
             shim,
             reader,
             writer,
-            tls_conf,
         };
-        if let Some((handshake, seq, auth_context)) = params {
-            mi.init_after_ssl(handshake, seq, auth_context).await?;
-        }
+        mi.init_after_ssl(handshake, seq, auth_context).await?;
         mi.run().await
-        // }
-        // }
     }
 
-    pub async fn init_before_ssl(
+    pub async fn init_ssl(
         shim: &mut B,
         input_stream: &mut S,
         output_stream: &mut W,
         tls_conf: &Option<std::sync::Arc<ServerConfig>>,
-    ) -> Result<(bool, Option<(ClientHandshake, u8, AuthenticationContext)>), B::Error> {
+    ) -> Result<
+        (
+            bool,
+            (ClientHandshake, u8, AuthenticationContext, CapabilityFlags),
+        ),
+        B::Error,
+    > {
         let mut reader = PacketReader::new(input_stream);
         let mut writer = PacketWriter::new(output_stream);
         // https://dev.mysql.com/doc/internals/en/connection-phase-packets.html#packet-Protocol::HandshakeV10
@@ -345,18 +339,18 @@ where
             server_capabilities
         };
 
-        let server_capabilities = server_capabilities.bits().to_le_bytes();
+        let server_capabilities_vec = server_capabilities.bits().to_le_bytes();
         let default_auth_plugin = shim.default_auth_plugin();
         let scramble = shim.salt();
 
         writer.write_all(&scramble[0..AUTH_PLUGIN_DATA_PART_1_LENGTH])?; // auth-plugin-data-part-1
         writer.write_all(&[0x00])?;
 
-        writer.write_all(&server_capabilities[..2])?; // The lower 2 bytes of the Capabilities Flags, 0x42
-                                                      // self.writer.write_all(&[0x00, 0x42])?;
+        writer.write_all(&server_capabilities_vec[..2])?; // The lower 2 bytes of the Capabilities Flags, 0x42
+                                                          // self.writer.write_all(&[0x00, 0x42])?;
         writer.write_all(&[0x21])?; // UTF8_GENERAL_CI
         writer.write_all(&[0x00, 0x00])?; // status_flags
-        writer.write_all(&server_capabilities[2..4])?; // The upper 2 bytes of the Capabilities Flags
+        writer.write_all(&server_capabilities_vec[2..4])?; // The upper 2 bytes of the Capabilities Flags
 
         if default_auth_plugin.is_empty() {
             // no plugins
@@ -430,22 +424,13 @@ where
 
         #[cfg(feature = "tls")]
         if handshake.capabilities.contains(CapabilityFlags::CLIENT_SSL) {
-            // let config = tls_conf.ok_or_else(|| {
-            //     io::Error::new(
-            //         io::ErrorKind::InvalidData,
-            //         "client requested SSL despite us not advertising support for it",
-            //     )
-            // })?;
-
             is_ssl = tls_conf.is_some();
-            // tls::switch_to_tls(config, &mut self.reader, &mut self.writer).await?;
-
             // auth_context.tls_client_certs = self.rw.tls_certs();
         }
-        Ok((is_ssl, Some((handshake, seq, auth_context))))
+        Ok((is_ssl, (handshake, seq, auth_context, server_capabilities)))
     }
 
-    async fn init_after_ssl(
+    pub async fn init_after_ssl(
         &mut self,
         mut handshake: ClientHandshake,
         mut seq: u8,
@@ -590,7 +575,7 @@ where
         Ok(())
     }
 
-    async fn run(mut self) -> Result<(), B::Error> {
+    pub async fn run(mut self) -> Result<(), B::Error> {
         use crate::commands::Command;
 
         let mut stmts: HashMap<u32, _> = HashMap::new();
@@ -777,4 +762,11 @@ where
         }
         Ok(())
     }
+}
+
+#[macro_export]
+macro_rules! secure_run_with_options {
+    ($shim: expr, $reader: expr, $writer: expr, $ops:expr, $tls: expr) => {
+        tls::secure_run_with_options($shim, $shim, $reader, $writer, $ops, $tls)
+    };
 }
